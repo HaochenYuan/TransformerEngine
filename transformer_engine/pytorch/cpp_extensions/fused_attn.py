@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -16,7 +16,6 @@ from transformer_engine_torch import (
     NVTE_Fused_Attn_Backend,
 )
 from ..quantized_tensor import Quantizer
-from ..constants import FP8BwdTensorIdx, FP8FwdTensorIdx
 
 
 __all__ = [
@@ -104,12 +103,12 @@ FusedAttnBackend = {
 BACKEND_F16m512_FP8_THREADS_PER_CTA = 128
 BACKEND_F16arb_ELTS_PER_THREADS = 16
 
-META_QKV = FP8FwdTensorIdx.GEMM1_OUTPUT
-META_DQKV = FP8BwdTensorIdx.GRAD_OUTPUT1
-META_O = FP8FwdTensorIdx.GEMM2_INPUT
-META_DO = FP8BwdTensorIdx.GRAD_INPUT2
-META_S = FP8FwdTensorIdx.GEMM3_OUTPUT
-META_DP = FP8BwdTensorIdx.GRAD_INPUT3
+META_QKV = tex.FP8FwdTensors.GEMM1_OUTPUT
+META_DQKV = tex.FP8BwdTensors.GRAD_OUTPUT1
+META_O = tex.FP8FwdTensors.GEMM2_INPUT
+META_DO = tex.FP8BwdTensors.GRAD_INPUT2
+META_S = tex.FP8FwdTensors.GEMM3_OUTPUT
+META_DP = tex.FP8BwdTensors.GRAD_INPUT3
 
 
 def fused_attn_fwd(
@@ -138,7 +137,6 @@ def fused_attn_fwd(
     attn_mask_type: str = "padding",
     softmax_type: str = "vanilla",
     window_size: Tuple[int, int] = (-1, -1),
-    bottom_right_diagonal: bool = None,
     rng_gen: torch.Generator = None,
     softmax_offset: torch.Tensor = None,
     return_max_logit: bool = False,
@@ -214,9 +212,6 @@ def fused_attn_fwd(
                 in [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q
                 + window_size[1]] inclusive. Special cases (-1, -1) and (-1, 0) mean no sliding
                 window and causal mask specifically.
-    bottom_right_diagonal: bool, default = None
-                whether to align sliding window and ALiBi diagonal to the top left (False) or
-                bottom right (True) corner of the softmax matrix.
     rng_gen : torch.Generator, default = None
                 random number generator;
                 if None, uses the default CUDA generator from PyTorch; otherwise, uses rng_gen
@@ -260,34 +255,19 @@ def fused_attn_fwd(
     max_logit : if return_max_logit = True, shape [h] and same data type as O; otherwise None
     """
 
-    if bottom_right_diagonal is None:
-        bottom_right_diagonal = attn_mask_type in {
-            "causal_bottom_right",
-            "padding_causal_bottom_right",
-        }
-
     if attn_scale is None:
         d = q.size(-1)
         attn_scale = 1.0 / math.sqrt(d)
 
     if attn_bias_type not in ["no_bias", "alibi"]:
-        if attn_bias is None:
-            raise ValueError(
-                f"attn_bias tensor cannot be None when attn_bias_type={attn_bias_type!r}."
-            )
-        if attn_bias.dtype != q.dtype:
-            raise ValueError(
-                "attn_bias tensor must have the same dtype as q and kv: "
-                f"attn_bias.dtype={attn_bias.dtype} but q.dtype={q.dtype}."
-            )
+        assert (
+            attn_bias is not None
+        ), "attn_bias tensor cannot be None when attn_bias_type is not no_bias or alibi."
+        assert attn_bias.dtype == q.dtype, "attn_bias tensor must be in the same dtype as q and kv."
 
-    if fused_attention_backend == FusedAttnBackend["No_Backend"]:
-        raise ValueError(
-            "Fused attention does not support this input combination:"
-            f" qkv_layout={qkv_layout!r}, attn_bias_type={attn_bias_type!r},"
-            f" attn_mask_type={attn_mask_type!r}, q.shape={list(q.shape)},"
-            f" q.dtype={q.dtype}, backend={fused_attention_backend}."
-        )
+    assert (
+        fused_attention_backend != FusedAttnBackend["No_Backend"]
+    ), "Fused attention does not support this input combination."
 
     # BF16/FP16 fused attention API from fmha_v1 apex
     if fused_attention_backend == FusedAttnBackend["F16_max512_seqlen"]:
@@ -303,16 +283,12 @@ def fused_attn_fwd(
             max_seqlen_q * max_seqlen_q + BACKEND_F16m512_FP8_THREADS_PER_CTA - 1
         ) // BACKEND_F16m512_FP8_THREADS_PER_CTA
 
-        if s_quantizer is None:
-            raise ValueError(
-                "s_quantizer is required for FP8 fused attention forward"
-                f" (backend={fused_attention_backend}, qkv_layout={qkv_layout!r})."
-            )
-        if o_quantizer is None:
-            raise ValueError(
-                "o_quantizer is required for FP8 fused attention forward"
-                f" (backend={fused_attention_backend}, qkv_layout={qkv_layout!r})."
-            )
+        assert (
+            s_quantizer is not None
+        ), "s_quantizer is required as an input for FP8 fused attention."
+        assert (
+            o_quantizer is not None
+        ), "o_quantizer is required as an input for FP8 fused attention."
     else:
         raise ValueError(f"Unsupported backend {fused_attention_backend}")
 
@@ -330,7 +306,6 @@ def fused_attn_fwd(
         AttnMaskType[attn_mask_type],
         SoftmaxType[softmax_type],
         window_size,
-        bottom_right_diagonal,
         cu_seqlens_q,
         cu_seqlens_kv,
         q,
@@ -351,53 +326,27 @@ def fused_attn_fwd(
         cuda_graph,
     )
 
+
+    # THD CUDA Graph: zero-fill output at positions beyond cu_seqlens[-1].
+    # Uses pure CUDA ops (no CPU sync) for CUDA graph capture compatibility.
+    if qkv_layout in ("t3hd", "th3d", "thd_t2hd", "thd_th2d", "thd_thd_thd"):
+        _out = output_tensors[0]
+        _aT_fwd = cu_seqlens_q[-1]
+        if _out.shape[0] > 0:
+            _m_fwd = torch.arange(_out.shape[0], device=_out.device) >= _aT_fwd
+            _out[_m_fwd] = 0
+
     if return_max_logit:
         qkv_format = qkv_layout.replace("3", "").replace("2", "").split("_")[0]
-        # thd (newer cuDNN runtimes, non-sm120): output_tensors: out [tq, h, d],    Stats [tq, h, 1],    Max [tq, h, 1]
-        # thd (older cuDNN runtimes or sm120):   output_tensors: out [tq, h, d],    Stats [b, h, sq, 1], Max [b, h, sq, 1]
-        # bshd:                                  output_tensors: out [b, sq, h, d], Stats [b, h, sq, 1], Max [b, h, sq, 1]
-        # sbhd:                                  output_tensors: out [sq, b, h, d], Stats [b, h, sq, 1], Max [b, h, sq, 1]
-        aux_ctx_tensors = [output_tensors[1]] + list(
-            output_tensors[3:]
-        )  # Stats + rng_state + optional tensors
-        max_tensor = output_tensors[2]
-        amax_dims = (0, 2) if max_tensor.ndim == 3 else (0, 2, 3)
-
-        if qkv_format == "thd":
-            if max_tensor.ndim == 4:
-                # For THD on cuDNN <= 9.6 or THD on sm120, Max tensor can be [b, h, sq, 1]
-                # with padded sequence positions. Exclude those padded positions when computing max_logit.
-                seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(device=max_tensor.device)
-                sq_idx = torch.arange(max_tensor.shape[2], device=max_tensor.device).view(
-                    1, 1, -1, 1
-                )
-                valid = sq_idx < seqlens_q.view(-1, 1, 1, 1)
-                max_tensor = max_tensor.masked_fill(~valid, float("-inf"))
-            elif max_tensor.ndim == 3:
-                if cu_seqlens_q_padded is not None:
-                    # For THD + pad_between_seqs=True + non-sm120 + cuDNN>9.6, Max tensor is [tq, h, 1]
-                    # and padding positions could be uninitialized. Exclude those padded positions when
-                    # computing max_logit.
-                    actual_seqlens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(
-                        device=max_tensor.device
-                    )
-                    padded_seqlens = (cu_seqlens_q_padded[1:] - cu_seqlens_q_padded[:-1]).to(
-                        device=max_tensor.device
-                    )
-                    pad_lens = (padded_seqlens - actual_seqlens).to(device=max_tensor.device)
-                    b = pad_lens.shape[0]
-
-                    # Stack [actual, pad] per batch into counts: e.g. [3,1, 3,1, 2,2, 7,1]
-                    counts = torch.stack([actual_seqlens, pad_lens], dim=1).flatten()
-                    # Tile [T, F] per sequence: [T,F, T,F, T,F, T,F]
-                    values = torch.tensor([True, False], device=max_tensor.device).repeat(b)
-                    # Expand: T×3, F×1, T×3, F×1, T×2, F×2, T×7, F×1 → TTTF|TTTF|TTFF|TTTTTTTF
-                    valid = torch.repeat_interleave(values, counts)
-                    # Finally, replace invalid (F) positions with -inf
-                    max_tensor = max_tensor.masked_fill(~valid.view(-1, 1, 1), float("-inf"))
-
+        # thd:  output_tensors: out [tq, h, d],    Max [tq, h, 1],    Sum_Exp [tq, h, 1]
+        # bshd: output_tensors: out [b, sq, h, d], Max [b, h, sq, 1], Sum_Exp [b, h, sq, 1]
+        # sbhd: output_tensors: out [sq, b, h, d], Max [b, h, sq, 1], Sum_Exp [b, h, sq, 1]
+        stats = output_tensors[1] + torch.log(output_tensors[2])
+        amax_dims = (0, 2) if qkv_format == "thd" else (0, 2, 3)
         # Max -> max_logit [h]
-        max_logit = torch.amax(max_tensor, dim=amax_dims).to(dtype=output_tensors[0].dtype)
+        max_logit = torch.amax(output_tensors[1], dim=amax_dims).to(dtype=output_tensors[0].dtype)
+        aux_ctx_tensors = [stats]
+        aux_ctx_tensors.extend(output_tensors[3:])
         return output_tensors[0], aux_ctx_tensors, max_logit
 
     # out, aux_ctx_tensors
@@ -431,7 +380,6 @@ def fused_attn_bwd(
     attn_mask_type: str = "padding",
     softmax_type: str = "vanilla",
     window_size: Tuple[int, int] = (-1, -1),
-    bottom_right_diagonal: bool = None,
     deterministic: bool = False,
     cuda_graph: bool = False,
 ) -> Tuple[Union[torch.Tensor, None], ...]:
@@ -504,9 +452,6 @@ def fused_attn_bwd(
                 in [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q
                 + window_size[1]] inclusive. Special cases (-1, -1) and (-1, 0) mean no sliding
                 window and causal mask specifically.
-    bottom_right_diagonal: bool, default = None
-                whether to align sliding window and ALiBi diagonal to the top left (False) or
-                bottom right (True) corner of the softmax matrix.
     deterministic : bool, default = False
                 whether to execute the backward pass with deterministic behaviours.
     cuda_graph : bool, default = False
@@ -527,54 +472,32 @@ def fused_attn_bwd(
                 gradient tensor of softmax offset of shape [1, h_q, 1, 1].
                 See softmax_type in DotProductAttention for details.
     """
-    if bottom_right_diagonal is None:
-        bottom_right_diagonal = attn_mask_type in {
-            "causal_bottom_right",
-            "padding_causal_bottom_right",
-        }
-
     if attn_scale is None:
         d = q.size(-1)
         attn_scale = 1.0 / math.sqrt(d)
 
-    if fused_attention_backend == FusedAttnBackend["No_Backend"]:
-        raise ValueError(
-            "Fused attention backward does not support this input combination:"
-            f" qkv_layout={qkv_layout!r}, attn_bias_type={attn_bias_type!r},"
-            f" attn_mask_type={attn_mask_type!r}, q.shape={list(q.shape)},"
-            f" q.dtype={q.dtype}, backend={fused_attention_backend}."
-        )
+    assert (
+        fused_attention_backend != FusedAttnBackend["No_Backend"]
+    ), "Fused attention does not support this input combination."
 
     if fused_attention_backend != FusedAttnBackend["F16_max512_seqlen"]:
-        if len(aux_ctx_tensors) < 1:
-            raise ValueError(
-                "aux_ctx_tensors must contain rng_state as its last element,"
-                f" but got len(aux_ctx_tensors)={len(aux_ctx_tensors)}"
-                f" for backend={fused_attention_backend}."
-            )
+        assert (
+            len(aux_ctx_tensors) >= 1
+        ), "aux_ctx_tensors must contain rng_state as its last element."
 
     if fused_attention_backend == FusedAttnBackend["FP8"]:
-        if s_quantizer is None:
-            raise ValueError(
-                "s_quantizer is required for FP8 fused attention backward"
-                f" (backend={fused_attention_backend}, qkv_layout={qkv_layout!r})."
-            )
-        if dp_quantizer is None:
-            raise ValueError(
-                "dp_quantizer is required for FP8 fused attention backward"
-                f" (backend={fused_attention_backend}, qkv_layout={qkv_layout!r})."
-            )
-        if dqkv_dtype is None:
-            raise ValueError(
-                "dqkv_dtype is required for FP8 fused attention backward"
-                f" (backend={fused_attention_backend}, qkv_layout={qkv_layout!r})."
-            )
-        if len(aux_ctx_tensors) != 3:
-            raise ValueError(
-                "aux_ctx_tensors must be [M, ZInv, rng_state] for FP8 fused attention,"
-                f" but got len(aux_ctx_tensors)={len(aux_ctx_tensors)}"
-                f" (backend={fused_attention_backend})."
-            )
+        assert (
+            s_quantizer is not None
+        ), "s_quantizer is required as an input for FP8 fused attention backward."
+        assert (
+            dp_quantizer is not None
+        ), "dp_quantizer is required as an input for FP8 fused attention backward."
+        assert (
+            dqkv_dtype is not None
+        ), "dqkv_dtype is required as an input for FP8 fused attention backward."
+        assert (
+            len(aux_ctx_tensors) == 3
+        ), "aux_ctx_tensors is required to be [M, ZInv, rng_state] for FP8 fused attention."
 
     output_tensors = tex.fused_attn_bwd(
         max_seqlen_q,
@@ -587,7 +510,6 @@ def fused_attn_bwd(
         AttnMaskType[attn_mask_type],
         SoftmaxType[softmax_type],
         window_size,
-        bottom_right_diagonal,
         deterministic,
         cu_seqlens_q,
         cu_seqlens_kv,
@@ -606,5 +528,14 @@ def fused_attn_bwd(
         dqkv_quantizer,
         cuda_graph,
     )
+
+
+    # THD CUDA Graph: zero-fill dQ/dK/dV at positions beyond cu_seqlens[-1].
+    if qkv_layout in ('t3hd', 'th3d', 'thd_t2hd', 'thd_th2d', 'thd_thd_thd'):
+        _aT_bwd = cu_seqlens_q[-1]
+        for _dt in output_tensors[:3]:
+            if hasattr(_dt, 'shape') and _dt.shape[0] > 0:
+                _m_bwd = torch.arange(_dt.shape[0], device=_dt.device) >= _aT_bwd
+                _dt[_m_bwd] = 0
 
     return output_tensors
