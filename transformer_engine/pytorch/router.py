@@ -274,7 +274,7 @@ class FusedAuxLoss(torch.autograd.Function):
         ctx,
         probs: torch.Tensor,
         tokens_per_expert: torch.Tensor,
-        total_num_tokens: int,
+        total_num_tokens: torch.Tensor,
         num_experts: int,
         topk: int,
         coeff: float,
@@ -314,7 +314,7 @@ class FusedAuxLoss(torch.autograd.Function):
 def fused_moe_aux_loss(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    total_num_tokens: int,
+    total_num_tokens: Union[int, torch.Tensor],
     num_experts: int,
     topk: int,
     coeff: float,
@@ -326,8 +326,12 @@ def fused_moe_aux_loss(
     probs : torch.Tensor in fp32/bf16/fp16
     tokens_per_expert : torch.Tensor in int32/int64/fp32/bf16
         the number of tokens per expert.
-    total_num_tokens : int
-        the total number of tokens used in the aux loss calculation.
+    total_num_tokens : int or 0-dim int64 CUDA torch.Tensor
+        the total number of tokens used in the aux loss calculation. A
+        device tensor is required for CUDA-graph-safe usage so the value
+        stays dynamic across replays; passing a Python int is supported as
+        a convenience and is materialized into a 0-dim int64 tensor on the
+        same device as ``probs`` before being forwarded to the kernel.
     num_experts : int
     topk : int
     coeff : float
@@ -338,4 +342,15 @@ def fused_moe_aux_loss(
     aux_loss : torch.Tensor.
         A scalar tensor in the same dtype as the "probs".
     """
+    if not isinstance(total_num_tokens, torch.Tensor):
+        total_num_tokens = torch.tensor(
+            int(total_num_tokens), dtype=torch.int64, device=probs.device
+        )
+    else:
+        if total_num_tokens.dim() != 0:
+            total_num_tokens = total_num_tokens.reshape(())
+        if total_num_tokens.dtype != torch.int64:
+            total_num_tokens = total_num_tokens.to(torch.int64)
+        if not total_num_tokens.is_cuda:
+            total_num_tokens = total_num_tokens.to(probs.device)
     return FusedAuxLoss.apply(probs, tokens_per_expert, total_num_tokens, num_experts, topk, coeff)

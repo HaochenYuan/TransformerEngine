@@ -51,9 +51,9 @@ void fused_score_for_moe_aux_loss_bwd(at::Tensor intermediate_output, at::Tensor
 
 std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
                                                           at::Tensor tokens_per_expert,
-                                                          int total_num_tokens, int num_experts,
-                                                          int num_rows, int num_cols, int topk,
-                                                          float coeff);
+                                                          at::Tensor total_num_tokens,
+                                                          int num_experts, int num_rows,
+                                                          int num_cols, int topk, float coeff);
 
 at::Tensor fused_moe_aux_loss_bwd(at::Tensor Const_buf, at::Tensor tokens_per_expert, int num_rows,
                                   int num_cols, at::Tensor grad_aux_loss);
